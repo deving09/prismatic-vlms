@@ -12,6 +12,7 @@ from transformers import PreTrainedTokenizerBase
 from prismatic.models.backbones.llm import LLaMa2LLMBackbone, LLMBackbone, MistralLLMBackbone, PhiLLMBackbone
 from prismatic.models.backbones.vision import (
     CLIPViTBackbone,
+    OpenCLIPViTBackbone,
     DinoCLIPViTBackbone,
     DinoSigLIPViTBackbone,
     DinoV2ViTBackbone,
@@ -37,6 +38,7 @@ VISION_BACKBONES = {
     # === Assorted CLIP Backbones ===
     "clip-vit-b": {"cls": CLIPViTBackbone, "kwargs": {"default_image_size": 224}},
     "clip-vit-l-336px": {"cls": CLIPViTBackbone, "kwargs": {"default_image_size": 336}},
+    "recap-clip-vit-l": {"cls": OpenCLIPViTBackbone, "kwargs": {"default_image_size": 224}},
 
     # === Assorted SigLIP Backbones ===
     "siglip-vit-b16-224px": {"cls": SigLIPViTBackbone, "kwargs": {"default_image_size": 224}},
