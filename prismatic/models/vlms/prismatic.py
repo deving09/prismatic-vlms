@@ -313,6 +313,12 @@ class PrismaticVLM(VLM):
                 patch_features = self.vision_backbone(pixel_values[multimodal_indices])
 
         # Projection Logic :: [bsz, num_patches, llm_embed_dim] =>> num_patches = (2 *) (256 + 1) for ViT-L + CLS
+        #print(patch_features)
+        #print(len(patch_features))
+        #print(patch_features[0].shape)
+        #print(patch_features.shape)
+        #print(self.projector)
+        #1/0
         projected_patch_embeddings = self.projector(patch_features)
         projected_patch_attention_mask = None
         if attention_mask is not None:
@@ -327,6 +333,10 @@ class PrismaticVLM(VLM):
         input_embeddings = self.llm_backbone.embed_input_ids(input_ids)
 
         # Build Multimodal Embeddings (and build resulting attention mask)
+        #print(input_embeddings[multimodal_indices, :1, :].shape)
+        #print(projected_patch_embeddings.shape)
+        #print(input_embeddings[multimodal_indices, 1:, :].shape)
+
         multimodal_embeddings = torch.cat(
             [
                 input_embeddings[multimodal_indices, :1, :],

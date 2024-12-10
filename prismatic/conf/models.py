@@ -90,7 +90,11 @@ class LLaVa_v15_Reproduction_7B(ModelConfig):
     align_max_steps: Optional[int] = None
     align_global_batch_size: int = 256
     align_per_device_batch_size: int = 16
-
+    
+    #devin shrunk
+    align_global_batch_size: int = 64
+    align_per_device_batch_size: int = 4
+    
     align_learning_rate: float = 1e-3
     align_weight_decay: float = 0.0
     align_max_grad_norm: float = 1.0
@@ -104,6 +108,9 @@ class LLaVa_v15_Reproduction_7B(ModelConfig):
     finetune_max_steps: Optional[int] = None
     finetune_global_batch_size: int = 128
     finetune_per_device_batch_size: int = 16
+    #Devin
+    finetune_global_batch_size: int = 32
+    finetune_per_device_batch_size: int = 4
 
     finetune_learning_rate: float = 2e-5
     finetune_weight_decay: float = 0.1

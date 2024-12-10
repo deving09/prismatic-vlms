@@ -11,7 +11,7 @@ Transformer model for feature extraction.
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from functools import partial
-from typing import Any, Callable, Dict, Optional, Protocol, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Protocol, Tuple, Union, Sequence
 
 import timm
 import torch
@@ -22,6 +22,7 @@ from timm.models.vision_transformer import Block, VisionTransformer
 from torch.distributed.fsdp.wrap import _module_wrap_policy, _or_policy, transformer_auto_wrap_policy
 from torchvision.transforms import Compose, Resize
 from torch.utils.checkpoint import checkpoint
+import torch.nn.functional as F
 
 
 import open_clip
@@ -51,6 +52,11 @@ class LetterboxPad:
         horizontal_pad, vertical_pad = int((max_wh - w) / 2), int((max_wh - h) / 2)
         padding = (horizontal_pad, vertical_pad, horizontal_pad, vertical_pad)
         return TVF.pad(image, padding, fill=self.padding_fill_value, padding_mode="constant")
+
+
+def _expand_token(token, batch_size: int):
+    return token.view(1, 1, -1).expand(batch_size, -1, -1)
+
 
 
 # === Abstract Base Class for arbitrary Vision Backbones ===
@@ -121,9 +127,24 @@ class OpenCLIPVisionViTBackbone(VisionBackbone, ABC):
 
         self.featurizer.eval()
 
+        #print({len(self.featurizer.transformer.resblocks) - 2})
+
+        #import inspect
+        #sig = inspect.signature(self.forward_intermediates)
+        #for param_name, param in sig.parameters.items():
+        #    print(f"Parameter: {param_name}, Default: {param.default}")
+        #1/0
         self.featurizer.forward = unpack_tuple(
-            partial(self.forward_intermediates, self.featurizer, n={len(self.featurizer.transformer.resblocks) - 2})
+            partial(self.get_intermediate_layers, n={len(self.featurizer.transformer.resblocks) - 2}, 
+                return_prefix_tokens=False, pad_num=30)
         )
+        
+        """
+        self.featurizer.forward = unpack_tuple(
+            #partial(self.forward_intermediates,  n={len(self.featurizer.transformer.resblocks) - 2})
+            partial(self.forward_intermediates,  n=len(self.featurizer.transformer.resblocks) - 2)
+        )
+        """
 
         pp_cfg = self.featurizer.preprocess_cfg
 
@@ -182,7 +203,19 @@ class OpenCLIPVisionViTBackbone(VisionBackbone, ABC):
 
     def forward(self, pixel_values: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> torch.Tensor:
         """Runs transformed image/pixel tensor through vision backbone, returning _all_ patch features."""
-        return self.featurizer(pixel_values)
+        feats = self.featurizer(pixel_values)
+        #print(feats[0].shape)
+        """
+        print(len(feats))
+        print(feats[0].shape)
+        print(feats[1].shape)
+        print(feats.shape)
+        """
+        #for feat in feats:
+        #    print(feat.shape)
+        #1/0
+        return feats
+        #return self.featurizer(pixel_values)
 
     @property
     def default_image_resolution(self) -> Tuple[int, int, int]:
@@ -190,7 +223,8 @@ class OpenCLIPVisionViTBackbone(VisionBackbone, ABC):
 
     @property
     def embed_dim(self) -> int:
-        return self.featurizer.output_dim
+        #return self.featurizer.output_dim
+        return 1024
 
     @property
     def num_patches(self) -> int:
@@ -203,32 +237,111 @@ class OpenCLIPVisionViTBackbone(VisionBackbone, ABC):
         return self.dtype
 
 
-    def forward_intermediates(featurizer, x, n=1, norm: bool=False,
-        intermediates_only=True):
+    def _intermediate_layers(
+            self, 
+            x: torch.Tensor,
+            n: Union[int, Sequence] = 1,
+            ):
+        outputs, num_blocks = [], len(self.featurizer.transformer.resblocks)
+        take_indices = set(range(num_blocks - n, num_blocks) if isinstance(n, int) else n)
+        # forward pass
+
+        x = self.featurizer.conv1(x)
+
+        x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
+        x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
+
+        # class embeddings and positional embeddings
+        x = torch.cat([_expand_token(self.featurizer.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
         
-        take_indices = [len(featurizer.transformer.resblocks) - n + i for i in range(n)]
+        x = x + self.featurizer.positional_embedding.to(x.dtype)
+        
+        x = self.featurizer.patch_dropout(x)
+        x = self.featurizer.ln_pre(x)
+        
+        if not self.featurizer.transformer.batch_first:
+            x = x.transpose(0, 1).contiguous()    # NLD -> LND
+
+        for i, blk in enumerate(self.featurizer.transformer.resblocks):
+            if self.featurizer.transformer.grad_checkpointing and not torch.jit.is_scripting():
+                x = checkpoint(blk, x, None, None, None)
+                #x = checkpoint(blk, x, None, None, attn_mask)
+                
+            else:
+                #x = blk(x, attn_mask=attn_mask)
+                x = blk(x)
+
+            if i in take_indices:
+                outputs.append(x)
+
+        return outputs
+
+    def get_intermediate_layers(self,
+            x:torch.Tensor,
+            n: Union[int, Sequence] = 1,
+            reshape: bool = False,
+            return_prefix_tokens: bool = False,
+            norm: bool = False,
+            pad_num: int = 14 ) -> Tuple[Union[torch.Tensor, Tuple[torch.Tensor]]]:
+
+        outputs = self._intermediate_layers(x, n)
+
+        if norm:
+            outputs = [self.featurizers.ln_post(out) for out in outputs]
+
+        # Process intermediates
+        new_intermediates = []
+        prefix_tokens = []
+        for intermeds in outputs:
+            p, toks = self.featurizer._global_pool(intermeds)
+            #new_intermediates.append(p)
+            new_intermediates.append(toks)
+            prefix_tokens.append(p)
+
+        outputs = new_intermediates
+        if reshape:
+            grid_size = self.featurizer.grid_size
+            outputs = [out.reshape(x.shape[0], grid_size[0], grid_size[1], -1).permute(0, 3, 1,2).contiguous()
+                for out in outputs
+            ]
+
+        if pad_num > 0:
+            outputs = [F.pad(out, pad=(0,0,pad_num, pad_num), mode="constant", value=0) for out in outputs]
+
+        if return_prefix_tokens:
+            return tuple(zip(outputs, prefix_tokens))
+        return tuple(outputs)
+        #prefix_tokens = [out[:, 0:self.featurizer.num_prefix_tokens] for out in outputs]
+        #outputs = [out[:
+
+    def forward_intermediates(self, x, n=1,
+            return_prefix_tokens: bool = False,
+            norm: bool=False,
+            intermediates_only=True):
+        
+        take_indices = [len(self.featurizer.transformer.resblocks) - n + i for i in range(n)]
         #take_indices, max_index = feature_take_indices(len(featurizer.transformer.resblocks), n)
 
         intermediates = []
-        x = featurizer.conv1(x)  # shape = [*, width, grid, grid]
+        x = self.featurizer.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
         
         # class embeddings and positional embeddings
-        x = torch.cat([_expand_token(featurizer.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
+        x = torch.cat([_expand_token(self.featurizer.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
         
         # shape = [*, grid ** 2 + 1, width]
         
-        x = x + featurizer.positional_embedding.to(x.dtype)
+        x = x + self.featurizer.positional_embedding.to(x.dtype)
         
-        x = featurizer.patch_dropout(x)
-        x = featurizer.ln_pre(x)
+        x = self.featurizer.patch_dropout(x)
+        x = self.featurizer.ln_pre(x)
 
-        if not featurizer.transformer.batch_first:
+        if not self.featurizer.transformer.batch_first:
             x = x.transpose(0, 1).contiguous()    # NLD -> LND
         
-        for i, blk in enumerate(featurizer.transformer.resblocks):
-            if featurizer.transformer.grad_checkpointing and not torch.jit.is_scripting():
+        for i, blk in enumerate(self.featurizer.transformer.resblocks):
+            if self.featurizer.transformer.grad_checkpointing and not torch.jit.is_scripting():
                 x = checkpoint(blk, x, None, None, None)
                 #x = checkpoint(blk, x, None, None, attn_mask)
                 
@@ -238,14 +351,15 @@ class OpenCLIPVisionViTBackbone(VisionBackbone, ABC):
             
             if i in take_indices:
                 #intermediates.append(featurizer.transformer.norm(x) if norm else x)
-                intermediates.append(featurizer.ln_post(x) if norm else x)
+                intermediates.append(self.featurizer.ln_post(x) if norm else x)
         
         # Process intermediates
         new_intermediates = []
         
         for intermeds in intermediates:
-            p, toks = featurizer._global_pool(intermeds)
-            new_intermediates.append(p)
+            p, toks = self.featurizer._global_pool(intermeds)
+            #new_intermediates.append(p)
+            new_intermediates.append(toks)
         
         intermediates = new_intermediates
         if not torch.jit.is_scripting() and return_prefix_tokens:
@@ -255,7 +369,7 @@ class OpenCLIPVisionViTBackbone(VisionBackbone, ABC):
         if intermediates_only:
             return intermediates
         
-        x = featurizer.ln_post(x)
+        x = self.featurizer.ln_post(x)
         
         return x, intermediates
 
@@ -391,6 +505,14 @@ class TimmViTBackbone(VisionBackbone, ABC):
         # Monkey-Patch the `forward()` function of the featurizer to ensure FSDP-compatibility
         #   => Note: By default set `get_intermediate_layers` to return the *SECOND-TO-LAST* layer patches!
         #   => TODO (siddk) Remove after resolution of https://github.com/pytorch/pytorch/issues/109385
+
+        #print({len(self.featurizer.blocks) - 2})
+        
+        #import inspect
+        #sig = inspect.signature(self.featurizer.get_intermediate_layers)
+        #for param_name, param in sig.parameters.items():
+        #    print(f"Parameter: {param_name}, Default: {param.default}")
+        # 1/0
         self.featurizer.forward = unpack_tuple(
             partial(self.featurizer.get_intermediate_layers, n={len(self.featurizer.blocks) - 2})
         )
@@ -456,7 +578,11 @@ class TimmViTBackbone(VisionBackbone, ABC):
 
     def forward(self, pixel_values: Union[torch.Tensor, Dict[str, torch.Tensor]]) -> torch.Tensor:
         """Runs transformed image/pixel tensor through vision backbone, returning _all_ patch features."""
-        return self.featurizer(pixel_values)
+        feats = self.featurizer(pixel_values)
+        #print(feats.shape)
+        #1/0
+        return feats
+        #return self.featurizer(pixel_values)
 
     @property
     def default_image_resolution(self) -> Tuple[int, int, int]:
